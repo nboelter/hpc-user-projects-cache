@@ -150,6 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     let _ = env::var("API_URL").expect("Environment variable `API_URL` should exist");
 
+    let bind_addr : SocketAddr = env::var("BIND_ADDR").expect("Environment variable `BIND_ADDR` should exist").parse().expect("Environment variable `CACHE_TIMEMOUT` should contain valid socket address");
+
     let cache_timeout = Duration::new(
         env::var("CACHE_TIMEOUT")
             .expect("Environment variable `CACHE_TIMEOUT` should exist")
@@ -169,8 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8282));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     loop {
         let (stream, _) = listener.accept().await?;
 
