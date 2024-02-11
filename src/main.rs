@@ -81,7 +81,6 @@ async fn handle_client_request(
     let auth_header = request.headers().get("Authorization");
 
     if auth_header.is_none() || !store.auth_header.eq(auth_header.unwrap()) {
-        log::info!("Unauthorized request");
         return hyper::Response::builder()
             .status(hyper::StatusCode::UNAUTHORIZED)
             .body(http_body_util::Full::new(hyper::body::Bytes::from(
@@ -114,14 +113,12 @@ async fn handle_client_request(
     }
 
     let user_projects = store.user_projects.read().unwrap();
-
     match &user_projects.get(&uri) {
-        Some(projects) => {
-            let response_body = serde_json::to_string(&projects).unwrap();
-            hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::from(
-                response_body,
+        Some(projects) => hyper::Response::builder()
+            .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                String::from(serde_json::to_string(&projects).unwrap()),
             )))
-        }
+            .unwrap(),
         None => hyper::Response::builder()
             .status(hyper::StatusCode::NOT_FOUND)
             .body(http_body_util::Full::new(hyper::body::Bytes::from(
@@ -192,17 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
     loop {
-        let (stream, addr) = match listener.accept().await {
-            Ok((socket, addr)) => {
-                log::debug!("Accepted new client: {:?}", addr);
-                (socket, addr)
-            }
-            Err(err) => {
-                log::warn!("Could not accept new client: {:?}", err);
-                continue;
-            }
-        };
-
+        let (stream, addr) = listener.accept().await?;
         let io = hyper_util::rt::TokioIo::new(stream);
 
         let service_store = store.clone();
@@ -212,17 +199,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
 
         tokio::task::spawn(async move {
-            match hyper::server::conn::http1::Builder::new()
+            if let Err(err) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
                 .await
             {
-                Ok(()) => {
-                    log::debug!("Connection to {} closed", addr);
-                }
-                Err(err) => {
-                    log::error!("Error serving connection: {:?}", err);
-                }
-            };
+                log::error!("Error serving connection from {addr}: {:?}", err);
+            }
         });
     }
 }
