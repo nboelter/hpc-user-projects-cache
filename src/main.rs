@@ -203,7 +203,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
-
         let io = hyper_util::rt::TokioIo::new(stream);
 
         let service_store = store.clone();
@@ -213,10 +212,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
 
         tokio::task::spawn(async move {
-
             match hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
-                .await {
+                .await
+            {
                 Ok(()) => {
                     log::debug!("Connection to {} closed", addr);
                 }
@@ -224,7 +223,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     log::error!("Error serving connection: {:?}", err);
                 }
             };
-
         });
     }
 }
