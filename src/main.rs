@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
+use std::process;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -41,24 +42,46 @@ struct Project {
 #[derive(Debug, Clone)]
 struct Store {
     user_projects: Arc<RwLock<ProjectMap>>,
+    last_update: Arc<RwLock<Instant>>,
+    api_token: String,
+    api_url: String,
+    auth_header: String,
+    cache_timeout: Duration,
 }
 
 impl Store {
     fn new() -> Self {
         Store {
             user_projects: Arc::new(RwLock::new(ProjectMap::new())),
+            last_update: Arc::new(RwLock::new(Instant::now())),
+            api_token: env::var("API_TOKEN")
+                .expect("Environment variable `API_TOKEN` should exist"),
+            api_url: env::var("API_URL").expect("Environment variable `API_URL` should exist"),
+            auth_header: format!(
+                "Bearer {}",
+                env::var("CLIENT_TOKEN").expect("Environment variable `CLIENT_TOKEN` should exist")
+            ),
+            cache_timeout: Duration::new(
+                env::var("CACHE_TIMEOUT")
+                    .expect("Environment variable `CACHE_TIMEOUT` should exist")
+                    .parse()
+                    .expect(
+                        "Environment variable `CACHE_TIMEMOUT` should contain timeout in seconds",
+                    ),
+                0,
+            ),
         }
     }
 }
 
-
-fn handle_client_request(request : hyper::Request<hyper::body::Incoming>, store : &Store) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>>
-{
-    let client_token = env::var("CLIENT_TOKEN").unwrap();
-    let expected = format!("Bearer {client_token}");
+async fn handle_client_request(
+    request: hyper::Request<hyper::body::Incoming>,
+    store: &Store,
+) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
     let auth_header = request.headers().get("Authorization");
 
-    if auth_header.is_none() || ! expected.eq(auth_header.unwrap()) {
+    if auth_header.is_none() || !store.auth_header.eq(auth_header.unwrap()) {
+        log::info!("Unauthorized request");
         return hyper::Response::builder()
             .status(hyper::StatusCode::UNAUTHORIZED)
             .body(http_body_util::Full::new(hyper::body::Bytes::from(
@@ -68,7 +91,28 @@ fn handle_client_request(request : hyper::Request<hyper::body::Incoming>, store 
     }
 
     let uri = request.uri().to_string();
-    log::info!("Handling request {:?}", uri);
+    log::debug!("Handling request {:?}", uri);
+
+    let elapsed = store.last_update.read().unwrap().elapsed();
+    if elapsed > store.cache_timeout {
+        *store.last_update.write().unwrap() = Instant::now();
+        if elapsed > store.cache_timeout * 10 {
+            // We await in case the cache is severely out of date.
+            // The disadvantage is that the client needs to wait a bit.
+            if let Err(err) = update_projects(store.clone()).await {
+                log::warn!("Could not update the cache: {}", err);
+            }
+        } else {
+            // Cache is not that old, refresh in the background
+            let task_store = store.clone();
+            tokio::task::spawn(async move {
+                if let Err(err) = update_projects(task_store).await {
+                    log::warn!("Could not update the cache: {}", err);
+                }
+            });
+        }
+    }
+
     let user_projects = store.user_projects.read().unwrap();
 
     match &user_projects.get(&uri) {
@@ -87,16 +131,13 @@ fn handle_client_request(request : hyper::Request<hyper::body::Incoming>, store 
     }
 }
 
-
-async fn update_projects(store: Store) -> Result<(), Box<dyn std::error::Error>> {
+async fn update_projects(store: Store) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = Instant::now();
     log::info!("Refreshing projects list.");
-    let token = env::var("API_TOKEN").unwrap();
-    let api_url = env::var("API_URL").unwrap();
     let client = reqwest::Client::new();
     let resp: HpcApi = client
-        .get(api_url)
-        .bearer_auth(token)
+        .get(&store.api_url)
+        .bearer_auth(&store.api_token)
         .send()
         .await?
         .json()
@@ -127,15 +168,7 @@ async fn update_projects(store: Store) -> Result<(), Box<dyn std::error::Error>>
             update.get_mut(&key).unwrap().push(project);
         }
     }
-
-    log::debug!("Waiting for write lock");
-    let start_locking = Instant::now();
-    {
-        let mut user_projects = store.user_projects.write().unwrap();
-        *user_projects = update;
-    }
-    log::debug!("Write finished. Elapsed: {:?}", start_locking.elapsed());
-
+    *store.user_projects.write().unwrap() = update;
     log::debug!("Refreshed projects list. Elapsed: {:?}", start.elapsed());
     Ok(())
 }
@@ -143,62 +176,55 @@ async fn update_projects(store: Store) -> Result<(), Box<dyn std::error::Error>>
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     env_logger::init();
-
-    let _ = env::var("CLIENT_TOKEN").expect("Environment variable `CLIENT_TOKEN` should exist");
-
-    let _ = env::var("API_TOKEN").expect("Environment variable `API_TOKEN` should exist");
-    
-    let _ = env::var("API_URL").expect("Environment variable `API_URL` should exist");
-
-    let bind_addr : SocketAddr = env::var("BIND_ADDR").expect("Environment variable `BIND_ADDR` should exist").parse().expect("Environment variable `CACHE_TIMEMOUT` should contain valid socket address");
-
-    let cache_timeout = Duration::new(
-        env::var("CACHE_TIMEOUT")
-            .expect("Environment variable `CACHE_TIMEOUT` should exist")
-            .parse()
-            .expect("Environment variable `CACHE_TIMEMOUT` should contain timeout in seconds"),
-        0,
-    );
+    let bind_addr: SocketAddr = env::var("BIND_ADDR")
+        .expect("Environment variable `BIND_ADDR` should exist")
+        .parse()
+        .expect("Environment variable `BIND_ADDR` should contain valid socket address");
 
     let store = Store::new();
-    let mut last_update = Instant::now();
 
-
-    {
-        let writer_lock = store.clone();
-        tokio::task::spawn(async move {
-            update_projects(writer_lock).await.unwrap();
-        });
+    if let Err(err) = update_projects(store.clone()).await {
+        log::error!("Could not fetch project list from API: {}", err);
+        process::exit(1);
     }
 
+    log::debug!("Listening on {:?}", bind_addr);
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, addr) = match listener.accept().await {
+            Ok((socket, addr)) => {
+                log::debug!("Accepted new client: {:?}", addr);
+                (socket, addr)
+            }
+            Err(err) => {
+                log::warn!("Could not accept new client: {:?}", err);
+                continue;
+            }
+        };
 
-        // Check if we should refresh the projects cache
-        if last_update.elapsed() > cache_timeout {
-            last_update = Instant::now();
-            let writer_lock = store.clone();
-            tokio::task::spawn(async move {
-                update_projects(writer_lock).await.unwrap();
-            });
-        }
-
-        let lock = store.clone();
-        let service = hyper::service::service_fn(move |request| {
-            let response = handle_client_request(request, &lock);
-            async move { Ok::<_, hyper::Error>(response) }
-        });
 
         let io = hyper_util::rt::TokioIo::new(stream);
 
+        let service_store = store.clone();
+        let service = hyper::service::service_fn(move |request| {
+            let handler_store = service_store.clone();
+            async move { Ok::<_, hyper::Error>(handle_client_request(request, &handler_store).await) }
+        });
+
         tokio::task::spawn(async move {
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
+
+            match hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
-                .await
-            {
-                println!("Error serving connection: {:?}", err);
-            }
+                .await {
+                Ok(()) => {
+                    log::debug!("Connection to {} closed", addr);
+                }
+                Err(err) => {
+                    log::error!("Error serving connection: {:?}", err);
+                }
+            };
+
         });
     }
 }
